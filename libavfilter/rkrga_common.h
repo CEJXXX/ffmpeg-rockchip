@@ -88,6 +88,7 @@ typedef struct RKRGAContext {
 
     int scheduler_core;
     int async_depth;
+    int sync_fallback;
     int afbc_out;
 
     int has_rga2;

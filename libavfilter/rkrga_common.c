@@ -1248,7 +1248,8 @@ static void rga_drain_fifo(RKRGAContext *r)
     RGAAsyncFrame aframe;
 
     while (r->async_fifo && av_fifo_read(r->async_fifo, &aframe, 1) >= 0) {
-        if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS)
+        if (aframe.dst->info.out_fence_fd > 0 &&
+            imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS)
             av_log(NULL, AV_LOG_WARNING, "RGA sync failed\n");
 
         set_rga_async_frame_lock_status(&aframe, 0);
@@ -1304,12 +1305,11 @@ static int call_rkrga_blit(AVFilterContext *avctx,
         av_log(avctx, AV_LOG_ERROR, "RGA blit failed: %d\n", ret);
         return AVERROR_EXTERNAL;
     }
+    /* Older rga2 kernel drivers (e.g. RV1126/RV1109 4.19 BSP) reject the
+     * async ioctl and hand back no fence. Let the caller fall back to sync. */
     if (dst_info->sync_mode == RGA_BLIT_ASYNC &&
-        dst_info->out_fence_fd <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "RGA async blit returned invalid fence_fd: %d\n",
-               dst_info->out_fence_fd);
-        return AVERROR_EXTERNAL;
-    }
+        dst_info->out_fence_fd <= 0)
+        return AVERROR(ENOSYS);
 
     return 0;
 }
@@ -1331,7 +1331,8 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
 
     /* Sync & Drain */
     while (r->eof && av_fifo_read(r->async_fifo, &aframe, 1) >= 0) {
-        if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS)
+        if (aframe.dst->info.out_fence_fd > 0 &&
+            imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS)
             av_log(ctx, AV_LOG_WARNING, "RGA sync failed\n");
 
         set_rga_async_frame_lock_status(&aframe, 0);
@@ -1412,10 +1413,23 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
     }
 
     /* Async Blit */
+    if (r->sync_fallback)
+        dst_frame->info.sync_mode = RGA_BLIT_SYNC;
     ret = call_rkrga_blit(ctx,
                           &src_frame->info,
                           &dst_frame->info,
                           pat_frame ? &pat_frame->info : NULL);
+    if (ret == AVERROR(ENOSYS)) {
+        av_log(ctx, AV_LOG_WARNING, "RGA driver returned no fence for an async blit, "
+               "falling back to synchronous blits\n");
+        r->sync_fallback = 1;
+        dst_frame->info.sync_mode    = RGA_BLIT_SYNC;
+        dst_frame->info.out_fence_fd = -1;
+        ret = call_rkrga_blit(ctx,
+                              &src_frame->info,
+                              &dst_frame->info,
+                              pat_frame ? &pat_frame->info : NULL);
+    }
     if (ret < 0)
         return ret;
 
@@ -1427,7 +1441,8 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
     /* Sync & Retrieve */
     if (av_fifo_can_read(r->async_fifo) > r->async_depth) {
         av_fifo_read(r->async_fifo, &aframe, 1);
-        if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS) {
+        if (aframe.dst->info.out_fence_fd > 0 &&
+            imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS) {
             av_log(ctx, AV_LOG_ERROR, "RGA sync failed\n");
             return AVERROR_EXTERNAL;
         }
